@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+"""Salvaschermo a comando dal tasto di accensione (quello sul retro dell'OBC40).
+
+Progetto obc40-screensaver: si installa con install.sh (vedi README.md).
+
+Gira nella sessione XFCE (autostart ~/.config/autostart/obc-screensaver.desktop) e legge
+il tasto da /dev/input/event0 (snvs-powerkey, gruppo input). Una pressione copre lo
+schermo con tubi 3D colorati che crescono in prospettiva, con davanti l'orologio, e
+abbassa la retroilluminazione; un'altra pressione, o un tocco sul display, lo toglie e
+ripristina la luminosita'. Il tocco che sblocca viene consumato: non arriva alle
+finestre sotto.
+
+Lo spegnimento col tasto resta disattivato perche' xfce4-power-manager tiene il blocco
+handle-power-key di elogind con power-button-action = 0 (nessuna azione).
+
+Uso: obc-screensaver [--dim PERCENTUALE | --demo]   (dim: default 5, 0 = invariata; --demo: mostra subito)
+"""
+import fcntl
+import glob
+import math
+import os
+import random
+import signal
+import struct
+import sys
+import time
+
+import cairo
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
+gi.require_foreign("cairo")
+from gi.repository import Gdk, GLib, Gtk, Pango, PangoCairo  # noqa: E402
+try:
+    from gi.repository import GLibUnix  # noqa: E402
+    signal_add = GLibUnix.signal_add
+except ImportError:                     # PyGObject piu' vecchio
+    signal_add = GLib.unix_signal_add
+
+KEY_NAME = "30370000.snvs:snvs-powerkey"
+EV_KEY, KEY_POWER = 1, 116
+EVENT = struct.Struct("llHHi")          # struct input_event (timeval a 64 bit su aarch64)
+BACKLIGHT = "/sys/class/backlight/backlight"
+GRACE = 0.4                             # s dopo l'attivazione in cui il tocco non sblocca
+MOVE_EVERY = 20                         # s tra uno spostamento e l'altro dell'orologio
+DAYS = ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"]
+MONTHS = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio",
+          "agosto", "settembre", "ottobre", "novembre", "dicembre"]
+
+# --- tubi ---------------------------------------------------------------------
+GRID = (16, 10, 8)        # celle in x, y e profondita'
+CAM = 6.0                 # distanza della camera dal piano piu' vicino (in celle)
+PIPE_R = 0.17             # raggio del tubo (in celle)
+BALL_R = 1.6              # raggio delle sfere di giunzione rispetto al tubo
+SPEED = 0.2               # avanzamento per fotogramma (in celle)
+FRAME_MS = 33
+PIPES_AT_ONCE = 2
+MAX_SEGMENTS = 320        # oltre: dissolvenza e si ricomincia
+FADE_FRAMES = 30
+COLORS = [(0.86, 0.18, 0.16), (0.16, 0.62, 0.22), (0.18, 0.38, 0.88), (0.92, 0.72, 0.12),
+          (0.62, 0.24, 0.78), (0.10, 0.70, 0.74), (0.90, 0.46, 0.12), (0.78, 0.78, 0.80)]
+DIRS = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
+BANDS = 12                # fasce del gradiente lungo la sezione del tubo
+
+
+def _unit(v):
+    n = math.sqrt(sum(c * c for c in v))
+    return tuple(c / n for c in v)
+
+
+LIGHT = _unit((-0.45, -0.6, 0.66))        # dall'alto a sinistra, verso chi guarda (y in giu')
+HALF = _unit((LIGHT[0], LIGHT[1], LIGHT[2] + 1))
+
+
+def shade(ci, n):
+    """Colore di un punto della superficie con normale n: stessa luce per tubi e sfere."""
+    d = max(0.0, n[0] * LIGHT[0] + n[1] * LIGHT[1] + n[2] * LIGHT[2])
+    s = max(0.0, n[0] * HALF[0] + n[1] * HALF[1] + n[2] * HALF[2]) ** 24 * 0.55
+    return tuple(min(1.0, c * (0.2 + 0.8 * d) + s) for c in COLORS[ci])
+
+
+def find_key_device():
+    for d in sorted(glob.glob("/sys/class/input/event*")):
+        try:
+            with open(os.path.join(d, "device/name")) as f:
+                if f.read().strip() == KEY_NAME:
+                    return "/dev/input/" + os.path.basename(d)
+        except OSError:
+            pass
+    return "/dev/input/event0"
+
+
+class Backlight:
+    def __init__(self, dim_pct):
+        self.dim_pct = dim_pct
+        self.saved = None
+
+    def _rw(self, name, value=None):
+        path = os.path.join(BACKLIGHT, name)
+        if value is None:
+            with open(path) as f:
+                return int(f.read())
+        with open(path, "w") as f:
+            f.write(str(value))
+
+    def dim(self):
+        if not self.dim_pct or self.saved is not None:
+            return
+        try:
+            cur, mx = self._rw("brightness"), self._rw("max_brightness")
+            self.saved = cur
+            self._rw("brightness", min(cur, max(1, round(mx * self.dim_pct / 100))))
+        except OSError as e:
+            print("retroilluminazione:", e, file=sys.stderr)
+
+    def restore(self):
+        if self.saved is None:
+            return
+        try:
+            self._rw("brightness", self.saved)
+        except OSError as e:
+            print("retroilluminazione:", e, file=sys.stderr)
+        self.saved = None
+
+
+class Pipes:
+    """Tubi in una griglia 3D proiettata in prospettiva.
+
+    Ogni tratto e' un cilindro (in prospettiva, un tronco di cono) ombreggiato con un
+    gradiente trasversale; gomiti e giunzioni sono sfere ombreggiate (sprite in cache).
+
+    Profondita': ogni pezzo va su un livello (una superficie trasparente ogni mezza cella
+    di profondita') e l'immagine si ricompone dal fondo verso chi guarda, cosi' un tubo
+    lontano resta dietro a uno vicino anche se e' stato disegnato dopo. Nella griglia ogni
+    cella ha un solo tubo, quindi pezzi alla stessa profondita' (entro mezza cella) non si
+    sovrappongono a schermo, salvo ai gomiti dello stesso tubo. A ogni fotogramma si
+    disegnano solo i pezzi nuovi e si ricompongono solo i rettangoli toccati, che step()
+    restituisce.
+    """
+
+    def __init__(self, w, h):
+        self.w, self.h = w, h
+        self.f = CAM * w / (GRID[0] - 1)
+        self.surface = cairo.ImageSurface(cairo.FORMAT_RGB24, w, h)   # immagine composta
+        self.cr = cairo.Context(self.surface)
+        self.sprites = {}
+        self.reset()
+
+    def reset(self):
+        self.cr.set_source_rgb(0, 0, 0)
+        self.cr.paint()
+        self.layers = {}                          # indice -> (superficie, contesto)
+        self.used = set()
+        self.pipes = []
+        self.segments = 0
+        self.fade = 0
+        self.rects = []
+        for _ in range(PIPES_AT_ONCE):
+            self.spawn()
+        self.compose()
+
+    def layer(self, depth):
+        """Contesto del livello per questa profondita' (0 = piano piu' vicino)."""
+        i = max(0, min(2 * GRID[2] - 2, int(math.floor(depth * 2 + 0.5))))
+        if i not in self.layers:
+            s = cairo.ImageSurface(cairo.FORMAT_ARGB32, self.w, self.h)
+            self.layers[i] = (s, cairo.Context(s))
+        return self.layers[i][1]
+
+    def compose(self):
+        """Ricompone i rettangoli toccati, dal livello piu' lontano al piu' vicino."""
+        out = []
+        order = [self.layers[i][0] for i in sorted(self.layers, reverse=True)]
+        for x0, y0, x1, y1 in self.rects:
+            x, y = max(0, int(x0) - 1), max(0, int(y0) - 1)
+            r = (x, y, min(self.w, int(x1) + 2) - x, min(self.h, int(y1) + 2) - y)
+            if r[2] <= 0 or r[3] <= 0:
+                continue
+            self.cr.rectangle(*r)
+            self.cr.set_source_rgb(0, 0, 0)
+            self.cr.fill_preserve()
+            for s in order:
+                self.cr.set_source_surface(s, 0, 0)
+                self.cr.fill_preserve()
+            self.cr.new_path()
+            out.append(r)
+        self.rects = []
+        return out
+
+    # proiezione e disegno
+    def project(self, p):
+        s = self.f / (CAM + p[2])
+        return (self.w / 2 + (p[0] - (GRID[0] - 1) / 2) * s,
+                self.h / 2 + (p[1] - (GRID[1] - 1) / 2) * s, PIPE_R * s)
+
+    def sprite(self, ci, r):
+        key = (ci, max(4, round(r * 2)))         # raggio a mezzi pixel
+        hit = self.sprites.get(key)
+        if hit:
+            return hit
+        rr = key[1] / 2
+        n = int(math.ceil(rr * 2)) + 2
+        cx = n / 2
+        stride = cairo.ImageSurface.format_stride_for_width(cairo.FORMAT_ARGB32, n)
+        buf = bytearray(stride * n)
+        for y in range(n):
+            dy = (y + 0.5 - cx) / rr
+            for x in range(n):
+                dx = (x + 0.5 - cx) / rr
+                d2 = dx * dx + dy * dy
+                a = min(1.0, (1 - math.sqrt(d2)) * rr + 0.5)
+                if a <= 0:
+                    continue
+                red, green, blue = shade(ci, (dx, dy, math.sqrt(max(0.0, 1 - d2))))
+                i = y * stride + x * 4                      # BGRA premoltiplicato
+                buf[i:i + 4] = bytes((int(blue * a * 255), int(green * a * 255),
+                                      int(red * a * 255), int(a * 255)))
+        s = cairo.ImageSurface.create_for_data(buf, cairo.FORMAT_ARGB32, n, n, stride)
+        self.sprites[key] = (s, n / 2, buf)
+        return self.sprites[key]
+
+    def blob(self, p, ci, scale=1.0):
+        x, y, r = self.project(p)
+        s, half, _ = self.sprite(ci, r * scale)
+        cr = self.layer(p[2])
+        cr.set_source_surface(s, x - half, y - half)
+        cr.paint()
+        self.rects.append((x - half, y - half, x + half, y + half))
+
+    def cone(self, pa, pb, ci, depth):
+        """Fianco di un tratto di tubo (tronco di cono), con la stessa luce delle sfere.
+
+        Il colore dipende solo dalla posizione lungo la sezione (fasce di un mesh gradient
+        scalate col raggio a ciascun capo): pezzi consecutivi combaciano senza gradini.
+        """
+        dx, dy = pb[0] - pa[0], pb[1] - pa[1]
+        ln = math.hypot(dx, dy)
+        if ln < 0.5:
+            return
+        nx, ny = -dy / ln, dx / ln
+        (xa, ya, ra), (xb, yb, rb) = pa, pb
+        mesh = cairo.MeshPattern()
+        g = 1.06                                  # un filo oltre il bordo, per l'antialiasing
+        prev = None
+        for i in range(BANDS + 1):
+            s = -1 + 2 * i / BANDS
+            col = shade(ci, (s * nx, s * ny, math.sqrt(max(0.0, 1 - s * s))))
+            cur = ((xa + nx * ra * s * g, ya + ny * ra * s * g),
+                   (xb + nx * rb * s * g, yb + ny * rb * s * g), col)
+            if prev:
+                mesh.begin_patch()
+                mesh.move_to(*prev[0])
+                mesh.line_to(*prev[1])
+                mesh.line_to(*cur[1])
+                mesh.line_to(*cur[0])
+                for corner, c in enumerate((prev[2], prev[2], cur[2], cur[2])):
+                    mesh.set_corner_color_rgb(corner, *c)
+                mesh.end_patch()
+            prev = cur
+        pts = [(xa + nx * ra, ya + ny * ra), (xb + nx * rb, yb + ny * rb),
+               (xb - nx * rb, yb - ny * rb), (xa - nx * ra, ya - ny * ra)]
+        cr = self.layer(depth)
+        cr.move_to(*pts[0])
+        for q in pts[1:]:
+            cr.line_to(*q)
+        cr.close_path()
+        cr.set_source(mesh)
+        cr.fill()
+        xs, ys = [q[0] for q in pts], [q[1] for q in pts]
+        self.rects.append((min(xs), min(ys), max(xs), max(ys)))
+
+    def sweep(self, a, b, t0, t1, ci):
+        """Tubo da a verso b, tra le frazioni t0 e t1 del segmento."""
+        self.cone(self.project(tuple(a[k] + (b[k] - a[k]) * t0 for k in range(3))),
+                  self.project(tuple(a[k] + (b[k] - a[k]) * t1 for k in range(3))), ci,
+                  a[2] + (b[2] - a[2]) * (t0 + t1) / 2)
+
+    # logica dei tubi
+    def free(self, c):
+        return all(0 <= c[k] < GRID[k] for k in range(3)) and c not in self.used
+
+    def spawn(self):
+        for _ in range(40):
+            c = tuple(random.randrange(n) for n in GRID)
+            if self.free(c):
+                self.used.add(c)
+                pipe = {"pos": c, "dir": None, "color": random.randrange(len(COLORS)),
+                        "left": random.randint(25, 70), "t": 0.0}
+                self.blob(c, pipe["color"], BALL_R)
+                if self.turn(pipe):
+                    self.pipes.append(pipe)
+                    return True
+        return False
+
+    def turn(self, pipe):
+        """Sceglie la prossima cella; False se il tubo e' chiuso o ha finito."""
+        if pipe["left"] <= 0:
+            return False
+        p, d = pipe["pos"], pipe["dir"]
+        ahead = d and tuple(p[k] + d[k] for k in range(3))
+        if ahead and self.free(ahead) and random.random() < 0.7:
+            nd = d
+        else:
+            opts = [nd for nd in DIRS if self.free(tuple(p[k] + nd[k] for k in range(3)))]
+            if not opts:
+                return False
+            nd = random.choice(opts)
+        pipe["dir"] = nd
+        pipe["target"] = tuple(p[k] + nd[k] for k in range(3))
+        pipe["t"] = 0.0
+        self.used.add(pipe["target"])
+        pipe["elbow"] = None
+        if d and nd != d:
+            # gomito; su alcune curve una sfera di giunzione piu' grossa
+            pipe["elbow"] = BALL_R if random.random() < 0.3 else 1.0
+            self.blob(p, pipe["color"], pipe["elbow"])
+        return True
+
+    def step(self):
+        """Avanza di un fotogramma; restituisce i rettangoli cambiati [(x, y, w, h), ...]."""
+        if self.fade:
+            self.fade -= 1
+            if self.fade:
+                self.cr.set_source_rgba(0, 0, 0, 0.15)
+                self.cr.paint()
+            else:
+                self.reset()
+            return [(0, 0, self.w, self.h)]
+        for pipe in list(self.pipes):
+            t0 = pipe["t"]
+            t1 = min(1.0, t0 + SPEED)
+            # ogni pezzo ripassa un po' il precedente: niente righe di antialiasing
+            # tra un fotogramma e l'altro (dentro il gomito, se c'e', non si vede)
+            self.sweep(pipe["pos"], pipe["target"], t0 - 0.05, t1, pipe["color"])
+            if pipe["dir"][2] > 0 and pipe["elbow"]:
+                # il tubo va all'indietro: i primi pezzi stanno sullo stesso livello del
+                # gomito, che e' piu' vicino e deve restare sopra
+                self.blob(pipe["pos"], pipe["color"], pipe["elbow"])
+            pipe["t"] = t1
+            if t1 < 1.0:
+                continue
+            pipe["pos"] = pipe["target"]
+            pipe["left"] -= 1
+            self.segments += 1
+            if not self.turn(pipe):
+                self.blob(pipe["pos"], pipe["color"])      # tappo in fondo al tubo
+                self.pipes.remove(pipe)
+                if not self.spawn():
+                    self.fade = FADE_FRAMES
+        if self.segments >= MAX_SEGMENTS:
+            self.fade = FADE_FRAMES
+        return self.compose()
+
+
+class Saver(Gtk.Window):
+    def __init__(self, on_close):
+        super().__init__(title="Salvaschermo")
+        self.on_close = on_close
+        self.shown_at = time.monotonic()
+        self.pos = (0.5, 0.5)
+        self.pipes = None
+        self.clock_rect = None
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_app_paintable(True)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
+                        | Gdk.EventMask.TOUCH_MASK | Gdk.EventMask.POINTER_MOTION_MASK)
+        self.connect("draw", self.on_draw)
+        self.connect("button-release-event", self.on_release)
+        self.connect("touch-event", self.on_touch)
+        self.connect("map-event", self.on_map)
+        self.connect("delete-event", lambda *_: True)   # si chiude solo col tasto o col tocco
+        self.fullscreen()
+        self.show_all()
+        self.ticks = [GLib.timeout_add_seconds(1, self.tick),
+                      GLib.timeout_add_seconds(MOVE_EVERY, self.move),
+                      GLib.timeout_add(FRAME_MS, self.frame)]
+
+    def on_map(self, *_):
+        gw = self.get_window()
+        gw.set_cursor(Gdk.Cursor.new_from_name(gw.get_display(), "none"))
+        self.grab_tries = 0
+        GLib.idle_add(self.grab)
+
+    def grab(self):
+        # tutto l'input al salvaschermo: il tocco non deve arrivare alle finestre sotto
+        seat = Gdk.Display.get_default().get_default_seat()
+        st = seat.grab(self.get_window(), Gdk.SeatCapabilities.ALL, True, None, None, None, None)
+        if st != Gdk.GrabStatus.SUCCESS and self.grab_tries < 20:
+            self.grab_tries += 1
+            GLib.timeout_add(100, self.grab)
+        return False
+
+    def frame(self):
+        if self.pipes:
+            for rect in self.pipes.step():
+                self.queue_draw_area(*rect)
+        return True
+
+    def tick(self):
+        if self.clock_rect:
+            self.queue_draw_area(*self.clock_rect)
+        return True
+
+    def move(self):
+        # sposta l'orologio per non segnare il pannello con un'immagine fissa
+        self.pos = (random.uniform(0.3, 0.7), random.uniform(0.3, 0.7))
+        self.queue_draw()
+        return True
+
+    def on_draw(self, _w, cr):
+        w, h = self.get_allocated_width(), self.get_allocated_height()
+        if not self.pipes or (self.pipes.w, self.pipes.h) != (w, h):
+            self.pipes = Pipes(w, h)
+        cr.set_source_surface(self.pipes.surface, 0, 0)
+        cr.paint()
+        self.draw_clock(cr, w, h)
+        return True
+
+    def draw_clock(self, cr, w, h):
+        now = time.localtime()
+        lines = [(time.strftime("%H:%M", now), "Inter Light %d" % max(24, h // 5), 0.95),
+                 ("%s %d %s" % (DAYS[now.tm_wday], now.tm_mday, MONTHS[now.tm_mon - 1]),
+                  "Inter %d" % max(10, h // 28), 0.75)]
+        layouts = []
+        for text, font, grey in lines:
+            lay = PangoCairo.create_layout(cr)
+            lay.set_font_description(Pango.FontDescription.from_string(font))
+            lay.set_text(text, -1)
+            layouts.append((lay, grey) + lay.get_pixel_size())
+        tw = max(lw for _, _, lw, _ in layouts)
+        th = sum(lh for _, _, _, lh in layouts)
+        pad = h // 30
+        bw, bh = tw + 3 * pad, th + 2 * pad
+        bx, by = w * self.pos[0] - bw / 2, h * self.pos[1] - bh / 2
+        # base scura semitrasparente: l'orologio resta leggibile sopra i tubi
+        rad = pad * 1.5
+        cr.new_sub_path()
+        cr.arc(bx + bw - rad, by + rad, rad, -math.pi / 2, 0)
+        cr.arc(bx + bw - rad, by + bh - rad, rad, 0, math.pi / 2)
+        cr.arc(bx + rad, by + bh - rad, rad, math.pi / 2, math.pi)
+        cr.arc(bx + rad, by + rad, rad, math.pi, 3 * math.pi / 2)
+        cr.close_path()
+        cr.set_source_rgba(0, 0, 0, 0.6)
+        cr.fill()
+        y = by + pad
+        for lay, grey, lw, lh in layouts:
+            cr.set_source_rgb(grey, grey, grey)
+            cr.move_to(w * self.pos[0] - lw / 2, y)
+            PangoCairo.show_layout(cr, lay)
+            y += lh
+        self.clock_rect = (int(bx) - 1, int(by) - 1, int(bw) + 3, int(bh) + 3)
+
+    def _touched(self):
+        if time.monotonic() - self.shown_at > GRACE:
+            self.on_close()
+        return True
+
+    def on_release(self, *_):
+        return self._touched()
+
+    def on_touch(self, _w, ev):
+        if ev.type in (Gdk.EventType.TOUCH_END, Gdk.EventType.TOUCH_CANCEL):
+            return self._touched()
+        return True
+
+    def close_saver(self):
+        for t in self.ticks:
+            GLib.source_remove(t)
+        Gdk.Display.get_default().get_default_seat().ungrab()
+        self.destroy()
+
+
+class App:
+    def __init__(self, dim_pct):
+        self.saver = None
+        self.backlight = Backlight(dim_pct)
+        dev = find_key_device()
+        self.fd = os.open(dev, os.O_RDONLY | os.O_NONBLOCK)
+        self.buf = b""
+        GLib.io_add_watch(self.fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR,
+                          self.on_input)
+        for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal_add(GLib.PRIORITY_DEFAULT, s, self.quit)
+
+    def on_input(self, fd, cond):
+        if cond & (GLib.IO_HUP | GLib.IO_ERR):
+            print("dispositivo del tasto chiuso", file=sys.stderr)
+            self.quit()
+            return False
+        try:
+            self.buf += os.read(fd, EVENT.size * 16)
+        except BlockingIOError:
+            return True
+        while len(self.buf) >= EVENT.size:
+            _, _, typ, code, value = EVENT.unpack_from(self.buf)
+            self.buf = self.buf[EVENT.size:]
+            if typ == EV_KEY and code == KEY_POWER and value == 1:
+                self.toggle()
+        return True
+
+    def toggle(self):
+        if self.saver:
+            self.hide()
+        else:
+            self.backlight.dim()
+            self.saver = Saver(self.hide)
+
+    def hide(self):
+        if self.saver:
+            self.saver.close_saver()
+            self.saver = None
+        self.backlight.restore()
+
+    def quit(self):
+        self.hide()
+        Gtk.main_quit()
+        return False
+
+
+def main():
+    dim = 5
+    args = sys.argv[1:]
+    if args[:1] == ["--dim"] and len(args) == 2:
+        dim = max(0, min(100, int(args[1])))
+    elif args == ["--demo"]:
+        # prova senza tasto: mostra subito il salvaschermo (si chiude col tocco)
+        win = Saver(Gtk.main_quit)
+        win.connect("destroy", lambda *_: Gtk.main_quit())
+        Gtk.main()
+        return
+    elif args:
+        sys.exit(__doc__.strip().splitlines()[-1])
+    # una sola istanza per utente
+    lock = open(os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
+                             "obc-screensaver-%d.lock" % os.getuid()), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("obc-screensaver e' gia' in esecuzione")
+    App(dim)
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

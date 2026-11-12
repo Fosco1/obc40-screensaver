@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Salvaschermo col tasto di accensione (OBC40)
+Comment=Il tasto sul retro mostra e toglie il salvaschermo; anche un tocco lo toglie
+Exec=@BIN@/obc-screensaver@ARGS@
+OnlyShowIn=XFCE;
+NoDisplay=true
