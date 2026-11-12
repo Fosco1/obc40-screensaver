@@ -354,6 +354,16 @@ class Pipes:
         return self.compose()
 
 
+def system_font_family():
+    """Famiglia del font di sistema (in XFCE: Impostazioni > Aspetto > Caratteri).
+
+    Si usa solo la famiglia: la dimensione dell'orologio dipende dallo schermo.
+    Letta a ogni disegno, cosi' un cambio di font si vede entro un secondo."""
+    settings = Gtk.Settings.get_default()
+    name = settings.get_property("gtk-font-name") if settings else None
+    return (Pango.FontDescription.from_string(name).get_family() if name else None) or "Sans"
+
+
 class Saver(Gtk.Window):
     def __init__(self, on_close):
         super().__init__(title="Salvaschermo")
@@ -423,13 +433,18 @@ class Saver(Gtk.Window):
 
     def draw_clock(self, cr, w, h):
         now = time.localtime()
-        lines = [(time.strftime("%H:%M", now), "Inter Light %d" % max(24, h // 5), 0.95),
+        family = system_font_family()
+        lines = [(time.strftime("%H:%M", now), Pango.Weight.LIGHT, max(24, h // 5), 0.95),
                  ("%s %d %s" % (DAYS[now.tm_wday], now.tm_mday, MONTHS[now.tm_mon - 1]),
-                  "Inter %d" % max(10, h // 28), 0.75)]
+                  Pango.Weight.NORMAL, max(10, h // 28), 0.75)]
         layouts = []
-        for text, font, grey in lines:
+        for text, weight, size, grey in lines:
+            font = Pango.FontDescription()
+            font.set_family(family)
+            font.set_weight(weight)     # se la famiglia non ha il Light, Pango usa il normale
+            font.set_size(size * Pango.SCALE)
             lay = PangoCairo.create_layout(cr)
-            lay.set_font_description(Pango.FontDescription.from_string(font))
+            lay.set_font_description(font)
             lay.set_text(text, -1)
             layouts.append((lay, grey) + lay.get_pixel_size())
         tw = max(lw for _, _, lw, _ in layouts)
