@@ -1,0 +1,3 @@
+# obc40-screensaver: lets the video group change the backlight, so the screensaver can dim the screen.
+# Installed in /etc/udev/rules.d/ by "sh install.sh --system" (as root).
+SUBSYSTEM=="backlight", ACTION=="add", RUN+="/bin/chgrp video /sys%p/brightness", RUN+="/bin/chmod g+w /sys%p/brightness"
